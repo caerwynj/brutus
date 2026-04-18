@@ -26,3 +26,4 @@ f(a: int)
 
 ### heading 3
 The final stage.
+Another wikilink [[test3.md]]  plumb this by clicking the mouse button 3 inside the link.
