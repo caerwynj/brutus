@@ -5,7 +5,7 @@ include "sys.m";
 
 include "draw.m";
 	draw: Draw;
-	Context, Point, Font: import draw;
+	Context, Point, Font, Display, Image, Rect: import draw;
 	ctxt: ref Context;
 
 include "tk.m";
@@ -23,6 +23,12 @@ include "selectfile.m";
 include	"bufio.m";
 	bufio: Bufio;
 	Iobuf: import bufio;
+
+include "imagefile.m";
+	imageremap: Imageremap;
+	readgif: RImagefile;
+	readjpg: RImagefile;
+	readpng: RImagefile;
 
 include	"workdir.m";
 
@@ -273,12 +279,21 @@ File: adt
 	rawview:	int;		# 1 iff currently showing raw markdown source
 	tables:		list of ref MdTable;
 	tablectr:	int;
+	images:		list of ref MdImage;
+	imagectr:	int;
 };
 
 MdTable: adt
 {
 	canv:	string;		# full widget path of the embedded canvas
 	src:	string;		# original markdown block (with trailing \n)
+};
+
+MdImage: adt
+{
+	canv:	string;		# full widget path of the embedded canvas
+	img:	string;		# Tk image resource name
+	src:	string;		# original markdown line (with trailing \n)
 };
 
 # Per-cell text run rendered in a single font.
@@ -416,7 +431,7 @@ control(ctxt: ref Context)
 
 	# f is not used to store anything, just to simplify interfaces
 	# shared by control and brutus
-	f := ref File (t, 1, "", 0, DEFSIZE, nil, 0, 0, 0, nil, 0);
+	f := ref File (t, 1, "", 0, DEFSIZE, nil, 0, 0, 0, nil, 0, nil, 0);
 
 	tkcmds(t, menu_cfg);
 	tkcmd(t, "frame .b");
@@ -589,7 +604,7 @@ brutus(ctxt: ref Context, filename: string)
 
 	(t, titlectl)  := tkclient->toplevel(ctxt, SETFONT, Name, Tkclient->Appl);
 
-	f := ref File (t, 0, filename, 0, DEFSIZE, nil, 0, 0, 0, nil, 0);
+	f := ref File (t, 0, filename, 0, DEFSIZE, nil, 0, 0, 0, nil, 0, nil, 0);
 	f.configed = array[NTAG] of {* => 0};
 
 	tkcmds(t, menu_cfg);
@@ -1235,6 +1250,15 @@ mdinsert(f: ref File, md: string)
 			i += nlines;
 			continue;
 		}
+		# standalone image: ![alt](path)
+		(imgok, imgalt, imgpath) := mdimageblock(line);
+		if(imgok){
+			err := mdrenderimage(f, imgalt, imgpath, line+"\n");
+			if(err != "")
+				sys->print("%s: image error: %s\n", Name, err);
+			i++;
+			continue;
+		}
 		# heading
 		if(len line >= 2 && line[0] == '#'){
 			level := 0;
@@ -1366,6 +1390,7 @@ mdviewtoggle(f: ref File)
 		src := tkcmd(t, ".ft.t get 1.0 {end - 1 char}");
 		tkcmd(t, ".ft.t delete 1.0 end");
 		mdcleartables(f);
+		mdclearimages(f);
 		mdinsert(f, src);
 		f.rawview = 0;
 		tkcmd(t, ".b.View configure -text Raw");
@@ -1374,6 +1399,7 @@ mdviewtoggle(f: ref File)
 		md := mddump(f);
 		tkcmd(t, ".ft.t delete 1.0 end");
 		mdcleartables(f);
+		mdclearimages(f);
 		if(md != "")
 			tkcmd(t, ".ft.t insert 1.0 "+tk->quote(md));
 		f.rawview = 1;
@@ -1495,6 +1521,8 @@ mddump(f: ref File): string
 					# source and splice it back into the output.
 					name := tag[7:];
 					src := mdfindtable(f, name);
+					if(src == "")
+						src = mdfindimage(f, name);
 					if(src != ""){
 						if(!atlinestart)
 							out += "\n";
@@ -2264,6 +2292,246 @@ mdfindtable(f: ref File, name: string): string
 		while(i > 0 && name[i-1] != '.')
 			i--;
 		if(name[i:] == c[i:] && c != "" && name != "")
+			return m.src;
+	}
+	return "";
+}
+
+# Recognise a standalone markdown image block: the whole line is
+# exactly `![alt](path)`.  Returns (1, alt, path) on match, else
+# (0, "", "").  Inline images (with surrounding prose) are not
+# rendered as embedded widgets - they remain as literal text.
+mdimageblock(ln: string)
+	: (int, string, string)
+{
+	n := len ln;
+	if(n < 5 || ln[0] != '!' || ln[1] != '[')
+		return (0, "", "");
+	i := 2;
+	while(i < n && ln[i] != ']')
+		i++;
+	if(i >= n || i+1 >= n || ln[i+1] != '(')
+		return (0, "", "");
+	altstr := ln[2:i];
+	j := i+2;
+	while(j < n && ln[j] != ')')
+		j++;
+	if(j != n-1)
+		return (0, "", "");
+	path := ln[i+2:j];
+	if(path == "")
+		return (0, "", "");
+	return (1, altstr, path);
+}
+
+# Join a parent file's path with a relative image path.  If `file` is
+# absolute (starts with '/' or '#') it is returned unchanged.
+mdfullname(parent, file: string): string
+{
+	if(len parent == 0 || (len file > 0 && (file[0] == '/' || file[0] == '#')))
+		return file;
+	for(i := len parent - 1; i >= 0; i--)
+		if(parent[i] == '/')
+			return parent[0:i+1] + file;
+	return file;
+}
+
+mdloadgif(): RImagefile
+{
+	if(readgif == nil){
+		readgif = load RImagefile RImagefile->READGIFPATH;
+		if(readgif != nil)
+			readgif->init(bufio);
+	}
+	return readgif;
+}
+
+mdloadjpg(): RImagefile
+{
+	if(readjpg == nil){
+		readjpg = load RImagefile RImagefile->READJPGPATH;
+		if(readjpg != nil)
+			readjpg->init(bufio);
+	}
+	return readjpg;
+}
+
+mdloadpng(): RImagefile
+{
+	if(readpng == nil){
+		readpng = load RImagefile RImagefile->READPNGPATH;
+		if(readpng != nil)
+			readpng->init(bufio);
+	}
+	return readpng;
+}
+
+mdfiletype(file: string, fd: ref Iobuf): RImagefile
+{
+	if(len file > 4 && file[len file - 4:] == ".gif")
+		return mdloadgif();
+	if(len file > 4 && file[len file - 4:] == ".jpg")
+		return mdloadjpg();
+	if(len file > 5 && file[len file - 5:] == ".jpeg")
+		return mdloadjpg();
+	if(len file > 4 && file[len file - 4:] == ".png")
+		return mdloadpng();
+	buf := array[20] of byte;
+	if(fd.read(buf, len buf) != len buf)
+		return nil;
+	fd.seek(big 0, 0);
+	if(string buf[0:6] == "GIF87a" || string buf[0:6] == "GIF89a")
+		return mdloadgif();
+	if(buf[0] == byte 16r89 && buf[1] == byte 'P' && buf[2] == byte 'N' && buf[3] == byte 'G')
+		return mdloadpng();
+	jpmagic := array[] of {byte 16rFF, byte 16rD8, byte 16rFF, byte 16rE0,
+		byte 0, byte 0, byte 'J', byte 'F', byte 'I', byte 'F', byte 0};
+	for(i := 0; i < len jpmagic; i++)
+		if(jpmagic[i] > byte 0 && buf[i] != jpmagic[i])
+			return nil;
+	return mdloadjpg();
+}
+
+mdtransparency(display: ref Draw->Display, r: ref RImagefile->Rawimage): ref Draw->Image
+{
+	if(r.transp == 0 || r.nchans != 1)
+		return nil;
+	i := display.newimage(r.r, display.image.chans, 0, 0);
+	if(i == nil)
+		return nil;
+	pic := r.chans[0];
+	npic := len pic;
+	mpic := array[npic] of byte;
+	index := r.trindex;
+	for(j := 0; j < npic; j++)
+		if(pic[j] == index)
+			mpic[j] = byte 0;
+		else
+			mpic[j] = byte 16rFF;
+	i.writepixels(i.r, mpic);
+	return i;
+}
+
+# Load an image file.  First tries display.open (Inferno native bitmap
+# format), then falls back to GIF / JPEG via the imagefile decoders.
+mdloadimage(display: ref Draw->Display, parent, file: string)
+	: (ref Draw->Image, ref Draw->Image, string)
+{
+	path := mdfullname(parent, file);
+	im := display.open(path);
+	mask: ref Draw->Image;
+	if(im != nil)
+		return (im, nil, "");
+
+	fd := bufio->open(path, Bufio->OREAD);
+	if(fd == nil)
+		return (nil, nil, sys->sprint("can't open %s: %r", path));
+	mod := mdfiletype(path, fd);
+	if(mod == nil)
+		return (nil, nil, sys->sprint("unknown image format: %s", path));
+	(ri, err) := mod->read(fd);
+	if(ri == nil)
+		return (nil, nil, sys->sprint("%s: %s", path, err));
+	mask = mdtransparency(display, ri);
+
+	if(imageremap == nil){
+		imageremap = load Imageremap Imageremap->PATH;
+		if(imageremap == nil)
+			return (nil, nil, sys->sprint("can't load imageremap: %r"));
+	}
+	(im, err) = imageremap->remap(ri, display, 1);
+	if(im == nil)
+		return (nil, nil, sys->sprint("remap %s: %s", path, err));
+	return (im, mask, "");
+}
+
+# Render a standalone markdown image at the current insert cursor.
+# Loads the image, installs it as a Tk image resource, draws it on a
+# child canvas of the text widget, embeds the canvas via `window
+# create`, and records the (canvas, img, source) triple so mddump can
+# round-trip it.
+mdrenderimage(f: ref File, alttxt, path, src: string): string
+{
+	alttxt = nil;
+	t := f.tk;
+	display: ref Draw->Display;
+	if(t != nil && t.image != nil)
+		display = t.image.display;
+	else if(ctxt != nil)
+		display = ctxt.display;
+	if(display == nil)
+		return "no display";
+
+	parent := "";
+	for(k := len f.name - 1; k >= 0; k--)
+		if(f.name[k] == '/'){
+			parent = f.name[0:k+1];
+			break;
+		}
+
+	(im, mask, err) := mdloadimage(display, parent, path);
+	if(err != "")
+		return err;
+
+	id := f.imagectr;
+	f.imagectr = id + 1;
+	imgname := "brutusimg" + string id;
+	canv := ".ft.t.img" + string id;
+
+	v := tkcmd(t, "image create bitmap " + imgname);
+	if(len v > 0 && v[0] == '!')
+		return v;
+	v = tk->putimage(t, imgname, im, mask);
+	if(len v > 0 && v[0] == '!'){
+		tkcmd(t, "image delete " + imgname);
+		return v;
+	}
+	w := im.r.dx();
+	h := im.r.dy();
+	v = tkcmd(t, "canvas " + canv + " -width " + string w + " -height " + string h);
+	if(len v > 0 && v[0] == '!'){
+		tkcmd(t, "image delete " + imgname);
+		return v;
+	}
+	v = tkcmd(t, canv + " create image 0 0 -anchor nw -image " + imgname);
+	if(len v > 0 && v[0] == '!'){
+		tkcmd(t, "destroy " + canv);
+		tkcmd(t, "image delete " + imgname);
+		return v;
+	}
+	tkcmd(t, ".ft.t window create insert -window " + canv);
+	mdput(f, "\n", DEFTAG);
+	f.images = ref MdImage(canv, imgname, src) :: f.images;
+	return "";
+}
+
+# Destroy any embedded image canvases (and their backing Tk image
+# resources).  Safe to call when f.images is empty.
+mdclearimages(f: ref File)
+{
+	t := f.tk;
+	for(l := f.images; l != nil; l = tl l){
+		m := hd l;
+		tkcmd(t, "destroy " + m.canv);
+		tkcmd(t, "image delete " + m.img);
+	}
+	f.images = nil;
+	f.imagectr = 0;
+}
+
+# Look up a canvas path in f.images; matches on full path or trailing
+# widget component.  Mirrors mdfindtable.
+mdfindimage(f: ref File, name: string): string
+{
+	for(l := f.images; l != nil; l = tl l){
+		m := hd l;
+		if(m.canv == name)
+			return m.src;
+		c := m.canv;
+		i := len c;
+		while(i > 0 && c[i-1] != '.')
+			i--;
+		if(c[i:] == name)
 			return m.src;
 	}
 	return "";
