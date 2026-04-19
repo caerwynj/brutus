@@ -5,7 +5,7 @@ include "sys.m";
 
 include "draw.m";
 	draw: Draw;
-	Context: import draw;
+	Context, Point, Font: import draw;
 	ctxt: ref Context;
 
 include "tk.m";
@@ -208,6 +208,58 @@ tagconfig = array[NTAG] of {
 
 enabled := array[] of {"disabled", "normal"};
 
+# alignment for table cells (subset of what table.b used)
+Aleft, Acenter, Aright: con iota;
+
+# Horizontal / vertical padding between table cells.
+TABHPAD: con 10;
+TABVPAD: con 4;
+
+# Font style indices for table cells (match the internal ordering used
+# by table.b).  Only the sizes actually rendered are populated; picking
+# a different size per cell means opening another font.
+TBL_NFONT: con 4;
+TBL_NSIZE: con 5;
+TBL_NFONTTAG: con TBL_NFONT * TBL_NSIZE;
+
+TBL_Roman,
+TBL_Italic,
+TBL_Bold,
+TBL_Type: con iota;
+
+TBL_Size6,
+TBL_Size8,
+TBL_Size10,
+TBL_Size12,
+TBL_Size16: con iota;
+
+# Font files keyed by (style*TBL_NSIZE + size).
+tbl_fontnames := array[TBL_NFONTTAG] of {
+	"/fonts/lucidasans/unicode.6.font",
+	"/fonts/lucidasans/unicode.7.font",
+	"/fonts/lucidasans/unicode.8.font",
+	"/fonts/lucidasans/unicode.10.font",
+	"/fonts/lucidasans/unicode.13.font",
+	"/fonts/lucidasans/italiclatin1.6.font",
+	"/fonts/lucidasans/italiclatin1.7.font",
+	"/fonts/lucidasans/italiclatin1.8.font",
+	"/fonts/lucidasans/italiclatin1.10.font",
+	"/fonts/lucidasans/italiclatin1.13.font",
+	"/fonts/lucidasans/boldlatin1.6.font",
+	"/fonts/lucidasans/boldlatin1.7.font",
+	"/fonts/lucidasans/boldlatin1.8.font",
+	"/fonts/lucidasans/boldlatin1.10.font",
+	"/fonts/lucidasans/boldlatin1.13.font",
+	"/fonts/lucidasans/typelatin1.6.font",
+	"/fonts/lucidasans/typelatin1.7.font",
+	"/fonts/pelm/latin1.9.font",
+	"/fonts/pelm/ascii.12.font",
+	"/fonts/pelm/ascii.16.font",
+};
+
+tbl_fontrefs := array[TBL_NFONTTAG] of ref Font;
+tbl_fontused := array[TBL_NFONTTAG] of { * => 0 };
+
 File: adt
 {
 	tk:			ref Tk->Toplevel;
@@ -219,6 +271,62 @@ File: adt
 	button1:		int;
 	button3:		int;
 	rawview:	int;		# 1 iff currently showing raw markdown source
+	tables:		list of ref MdTable;
+	tablectr:	int;
+};
+
+MdTable: adt
+{
+	canv:	string;		# full widget path of the embedded canvas
+	src:	string;		# original markdown block (with trailing \n)
+};
+
+# Per-cell text run rendered in a single font.
+TblItem: adt
+{
+	s:		string;
+	fontnum:	int;
+	pos:		Point;
+	width:	int;
+	next:		cyclic ref TblItem;
+};
+
+TblCell: adt
+{
+	items:	ref TblItem;
+	halign:	int;
+	width:	int;
+	height:	int;
+	ascent:	int;
+	pos:		Point;	# nw corner of cell, in canvas coords
+	row:		int;
+	col:		int;
+};
+
+TblRow: adt
+{
+	cells:	array of ref TblCell;
+	height:	int;
+	ascent:	int;
+	pos:		Point;
+};
+
+TblCol: adt
+{
+	width:	int;
+	halign:	int;
+	pos:		Point;
+};
+
+Tbl: adt
+{
+	nrow:	int;
+	ncol:	int;
+	width:	int;
+	height:	int;
+	border:	int;
+	cols:		array of ref TblCol;
+	rows:		array of ref TblRow;
 };
 
 menuindex := "0";
@@ -308,7 +416,7 @@ control(ctxt: ref Context)
 
 	# f is not used to store anything, just to simplify interfaces
 	# shared by control and brutus
-	f := ref File (t, 1, "", 0, DEFSIZE, nil, 0, 0, 0);
+	f := ref File (t, 1, "", 0, DEFSIZE, nil, 0, 0, 0, nil, 0);
 
 	tkcmds(t, menu_cfg);
 	tkcmd(t, "frame .b");
@@ -481,7 +589,7 @@ brutus(ctxt: ref Context, filename: string)
 
 	(t, titlectl)  := tkclient->toplevel(ctxt, SETFONT, Name, Tkclient->Appl);
 
-	f := ref File (t, 0, filename, 0, DEFSIZE, nil, 0, 0, 0);
+	f := ref File (t, 0, filename, 0, DEFSIZE, nil, 0, 0, 0, nil, 0);
 	f.configed = array[NTAG] of {* => 0};
 
 	tkcmds(t, menu_cfg);
@@ -1088,41 +1196,43 @@ mdinline(f: ref File, line, basetag: string)
 mdinsert(f: ref File, md: string)
 {
 	configfont(f, DEFTAG);
-	end := len md;
+	lines := mdlines(md);
+	n := len lines;
 	i := 0;
-	while(i < end){
-		j := i;
-		while(j < end && md[j] != '\n')
-			j++;
-		line := md[i:j];
-		nexti := j;
-		if(nexti < end)
-			nexti++;	# consume the newline
+	while(i < n){
+		line := lines[i];
 		# fenced code block
 		if(len line >= 3 && line[0:3] == "```"){
 			code := "";
-			i = nexti;
-			for(;;){
-				if(i >= end)
-					break;
-				k := i;
-				while(k < end && md[k] != '\n')
-					k++;
-				cline := md[i:k];
-				ni := k;
-				if(ni < end)
-					ni++;
-				if(len cline >= 3 && cline[0:3] == "```"){
-					i = ni;
+			i++;
+			while(i < n){
+				if(len lines[i] >= 3 && lines[i][0:3] == "```"){
+					i++;
 					break;
 				}
 				if(code != "")
 					code += "\n";
-				code += cline;
-				i = ni;
+				code += lines[i];
+				i++;
 			}
 			configfont(f, "Example");
 			mdput(f, code+"\n", "Example");
+			continue;
+		}
+		# pipe-syntax table
+		(nlines, cells, align) := mdtableblock(lines, i);
+		if(nlines > 0){
+			src := "";
+			for(k := 0; k < nlines; k++){
+				if(src != "")
+					src += "\n";
+				src += lines[i+k];
+			}
+			src += "\n";
+			err := mdrendertable(f, cells, align, src);
+			if(err != "")
+				sys->print("%s: table error: %s\n", Name, err);
+			i += nlines;
 			continue;
 		}
 		# heading
@@ -1143,7 +1253,7 @@ mdinsert(f: ref File, md: string)
 				tag := "Heading "+btag;
 				mdinline(f, text, tag);
 				mdput(f, "\n", tag);
-				i = nexti;
+				i++;
 				continue;
 			}
 		}
@@ -1155,26 +1265,26 @@ mdinsert(f: ref File, md: string)
 			tag := "List List-elem";
 			mdinline(f, text, tag);
 			mdput(f, "\n", tag);
-			i = nexti;
+			i++;
 			continue;
 		}
 		# indented code block (4+ spaces)
 		if(len line >= 4 && line[0:4] == "    "){
 			configfont(f, "Example");
 			mdput(f, line[4:]+"\n", "Example");
-			i = nexti;
+			i++;
 			continue;
 		}
 		# blank line -> paragraph break
 		if(line == ""){
 			mdput(f, "\n", DEFTAG);
-			i = nexti;
+			i++;
 			continue;
 		}
 		# plain paragraph line
 		mdinline(f, line, DEFTAG);
 		mdput(f, "\n", DEFTAG);
-		i = nexti;
+		i++;
 	}
 }
 
@@ -1255,6 +1365,7 @@ mdviewtoggle(f: ref File)
 		# raw -> rendered: re-parse current text as markdown
 		src := tkcmd(t, ".ft.t get 1.0 {end - 1 char}");
 		tkcmd(t, ".ft.t delete 1.0 end");
+		mdcleartables(f);
 		mdinsert(f, src);
 		f.rawview = 0;
 		tkcmd(t, ".b.View configure -text Raw");
@@ -1262,6 +1373,7 @@ mdviewtoggle(f: ref File)
 		# rendered -> raw: dump to markdown, replace with plain text
 		md := mddump(f);
 		tkcmd(t, ".ft.t delete 1.0 end");
+		mdcleartables(f);
 		if(md != "")
 			tkcmd(t, ".ft.t insert 1.0 "+tk->quote(md));
 		f.rawview = 1;
@@ -1303,6 +1415,7 @@ mddump(f: ref File): string
 	atlinestart := 1;
 	pendinghead := 0;
 	pendinglist := 0;
+	inlist := 0;
 
 	end := len s;
 	i := 0;
@@ -1370,10 +1483,24 @@ mddump(f: ref File): string
 						out += "```\n";
 					}
 				}else if(tag == "List-elem"){
-					if(on)
+					if(on){
 						pendinglist = 1;
-					else
+						inlist = 1;
+					}else{
 						pendinglist = 0;
+						inlist = 0;
+					}
+				}else if(len tag > 7 && tag[0:7] == "Window "){
+					# Embedded widget: look up the original markdown
+					# source and splice it back into the output.
+					name := tag[7:];
+					src := mdfindtable(f, name);
+					if(src != ""){
+						if(!atlinestart)
+							out += "\n";
+						out += src;
+						atlinestart = 1;
+					}
 				}
 				# other tags: ignore
 				i += nc;
@@ -1415,6 +1542,10 @@ mddump(f: ref File): string
 			pendinglist = 0;
 			out += "\n";
 			atlinestart = 1;
+			# consecutive list items share the same <List-elem> tag in
+			# the sgml dump, so re-arm the "- " prefix for the next line
+			if(inlist)
+				pendinglist = 1;
 			continue;
 		}
 
@@ -1485,6 +1616,659 @@ sgml(t: ref Tk->Toplevel, start, end: string): string
 	return s;
 }
 
+# Parse a pipe-syntax markdown table starting at lines[i].
+# Returns (n, cells, align): n is the number of consumed lines
+# (0 if no match), cells is cells[row][col] with headers as row 0,
+# and align[col] is Aleft / Acenter / Aright from the separator row.
+mdtableblock(lines: array of string, start: int)
+	: (int, array of array of string, array of int)
+{
+	if(start+1 >= len lines)
+		return (0, nil, nil);
+	header := lines[start];
+	sep := lines[start+1];
+	if(!mdtableishead(header) || !mdtableissep(sep))
+		return (0, nil, nil);
+	hcells := mdtablesplit(header);
+	scells := mdtablesplit(sep);
+	ncol := len hcells;
+	if(ncol == 0 || len scells != ncol)
+		return (0, nil, nil);
+
+	align := array[ncol] of int;
+	for(k := 0; k < ncol; k++)
+		align[k] = mdtablealign(scells[k]);
+
+	rows := list of {hcells};
+	i := start + 2;
+	while(i < len lines){
+		if(!mdtableishead(lines[i]))
+			break;
+		c := mdtablesplit(lines[i]);
+		if(len c != ncol){
+			# pad / truncate to match the header width
+			padded := array[ncol] of string;
+			for(k = 0; k < ncol; k++){
+				if(k < len c)
+					padded[k] = c[k];
+				else
+					padded[k] = "";
+			}
+			c = padded;
+		}
+		rows = c :: rows;
+		i++;
+	}
+	nrow := 0;
+	for(l := rows; l != nil; l = tl l)
+		nrow++;
+	cells := array[nrow] of array of string;
+	# rows is in reverse order
+	idx := nrow - 1;
+	for(l = rows; l != nil; l = tl l){
+		cells[idx] = hd l;
+		idx--;
+	}
+	return (i - start, cells, align);
+}
+
+# Does the line look like a table row (contains at least one '|')?
+mdtableishead(s: string): int
+{
+	for(i := 0; i < len s; i++)
+		if(s[i] == '|')
+			return 1;
+	return 0;
+}
+
+# Is the line a separator row (pipes, dashes, colons, whitespace only)?
+mdtableissep(s: string): int
+{
+	# must have at least one '-' and at least one '|'
+	seenpipe := 0;
+	seendash := 0;
+	for(i := 0; i < len s; i++){
+		c := s[i];
+		case c {
+		'|' =>
+			seenpipe = 1;
+		'-' =>
+			seendash = 1;
+		':' or ' ' or '\t' =>
+			;
+		* =>
+			return 0;
+		}
+	}
+	return seenpipe && seendash;
+}
+
+# Split a pipe row into cells, trimming whitespace and stripping
+# leading / trailing empty cells produced by surrounding pipes.
+mdtablesplit(s: string): array of string
+{
+	parts := list of {""};
+	n := len s;
+	# skip one leading pipe if present
+	i := 0;
+	while(i < n && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	if(i < n && s[i] == '|')
+		i++;
+	cur := "";
+	for(; i < n; i++){
+		c := s[i];
+		if(c == '\\' && i+1 < n){
+			cur[len cur] = s[i+1];
+			i++;
+			continue;
+		}
+		if(c == '|'){
+			parts = cur :: parts;
+			cur = "";
+			continue;
+		}
+		cur[len cur] = c;
+	}
+	# drop trailing empty cell if the row ended with '|'
+	trail := 1;
+	for(j := len cur-1; j >= 0; j--)
+		if(cur[j] != ' ' && cur[j] != '\t'){
+			trail = 0;
+			break;
+		}
+	if(!trail)
+		parts = cur :: parts;
+	n2 := 0;
+	for(l := parts; l != nil; l = tl l)
+		n2++;
+	arr := array[n2] of string;
+	idx := n2 - 1;
+	for(l = parts; l != nil; l = tl l){
+		arr[idx] = mdtrim(hd l);
+		idx--;
+	}
+	return arr;
+}
+
+# Decide a column's alignment from its separator cell (":---", "---:", ":-:").
+mdtablealign(sep: string): int
+{
+	left := 0;
+	right := 0;
+	for(i := 0; i < len sep; i++){
+		if(sep[i] == ':'){
+			# first colon of the cell marks left; last marks right
+			if(left == 0)
+				left = 1;
+			right = 1;
+			# look for subsequent colons
+			for(j := i+1; j < len sep; j++)
+				if(sep[j] == ':'){
+					right = 1;
+				}
+			break;
+		}
+	}
+	# recompute: left = ':' at start of trimmed cell, right = ':' at end
+	t := mdtrim(sep);
+	left = len t > 0 && t[0] == ':';
+	right = len t > 0 && t[len t - 1] == ':';
+	if(left && right)
+		return Acenter;
+	if(right)
+		return Aright;
+	return Aleft;
+}
+
+mdtrim(s: string): string
+{
+	i := 0;
+	while(i < len s && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	j := len s;
+	while(j > i && (s[j-1] == ' ' || s[j-1] == '\t'))
+		j--;
+	return s[i:j];
+}
+
+# Split a string on '\n' into an array of lines.  The trailing newline,
+# if any, does not produce an empty final element.
+mdlines(s: string): array of string
+{
+	n := 0;
+	for(i := 0; i < len s; i++)
+		if(s[i] == '\n')
+			n++;
+	if(len s > 0 && s[len s-1] != '\n')
+		n++;
+	arr := array[n] of string;
+	idx := 0;
+	start := 0;
+	for(i = 0; i < len s; i++)
+		if(s[i] == '\n'){
+			arr[idx++] = s[start:i];
+			start = i+1;
+		}
+	if(start < len s)
+		arr[idx++] = s[start:];
+	return arr;
+}
+
+# Convert a cell's raw text into a list of TblItem runs (one per
+# styled fragment).  Defaults to the Roman.10 font; bold / italic /
+# inline-code runs use matching font families.
+tbl_cellitems(text: string): ref TblItem
+{
+	head: ref TblItem;
+	var_tail: ref TblItem;
+	end := len text;
+	i := 0;
+	while(i < end){
+		j := i;
+		while(j < end){
+			c := text[j];
+			if(c == '*' || c == '_' || c == '`' || c == '\\')
+				break;
+			j++;
+		}
+		if(j > i){
+			it := ref TblItem(text[i:j], tbl_fnum(TBL_Roman, TBL_Size10),
+				Point(0,0), 0, nil);
+			(head, var_tail) = tbl_append(head, var_tail, it);
+		}
+		if(j >= end)
+			break;
+		c := text[j];
+		if(c == '\\' && j+1 < end){
+			it := ref TblItem(text[j+1:j+2], tbl_fnum(TBL_Roman, TBL_Size10),
+				Point(0,0), 0, nil);
+			(head, var_tail) = tbl_append(head, var_tail, it);
+			i = j+2;
+			continue;
+		}
+		if(c == '`'){
+			k := j+1;
+			while(k < end && text[k] != '`')
+				k++;
+			if(k < end){
+				it := ref TblItem(text[j+1:k],
+					tbl_fnum(TBL_Type, TBL_Size10), Point(0,0), 0, nil);
+				(head, var_tail) = tbl_append(head, var_tail, it);
+				i = k+1;
+				continue;
+			}
+			# unterminated: treat literally
+			it := ref TblItem(text[j:j+1], tbl_fnum(TBL_Roman, TBL_Size10),
+				Point(0,0), 0, nil);
+			(head, var_tail) = tbl_append(head, var_tail, it);
+			i = j+1;
+			continue;
+		}
+		# '*' or '_': bold if doubled, italic otherwise
+		if(j+1 < end && text[j+1] == c){
+			k := j+2;
+			found := 0;
+			while(k+1 < end){
+				if(text[k] == c && text[k+1] == c){
+					found = 1;
+					break;
+				}
+				k++;
+			}
+			if(found){
+				it := ref TblItem(text[j+2:k],
+					tbl_fnum(TBL_Bold, TBL_Size10), Point(0,0), 0, nil);
+				(head, var_tail) = tbl_append(head, var_tail, it);
+				i = k+2;
+				continue;
+			}
+		}
+		k := j+1;
+		found := 0;
+		while(k < end){
+			if(text[k] == c){
+				found = 1;
+				break;
+			}
+			k++;
+		}
+		if(found){
+			it := ref TblItem(text[j+1:k],
+				tbl_fnum(TBL_Italic, TBL_Size10), Point(0,0), 0, nil);
+			(head, var_tail) = tbl_append(head, var_tail, it);
+			i = k+1;
+			continue;
+		}
+		it := ref TblItem(text[j:j+1], tbl_fnum(TBL_Roman, TBL_Size10),
+			Point(0,0), 0, nil);
+		(head, var_tail) = tbl_append(head, var_tail, it);
+		i = j+1;
+	}
+	return head;
+}
+
+tbl_append(head, var_tail, it: ref TblItem): (ref TblItem, ref TblItem)
+{
+	if(head == nil)
+		return (it, it);
+	var_tail.next = it;
+	return (head, it);
+}
+
+tbl_fnum(fstyle, fsize: int): int
+{
+	n := fstyle * TBL_NSIZE + fsize;
+	if(n < 0 || n >= TBL_NFONTTAG)
+		n = tbl_fnum(TBL_Roman, TBL_Size10);
+	tbl_fontused[n] = 1;
+	return n;
+}
+
+tbl_loadfonts(display: ref Draw->Display): string
+{
+	for(i := 0; i < TBL_NFONTTAG; i++){
+		if(tbl_fontused[i] && tbl_fontrefs[i] == nil){
+			fname := tbl_fontnames[i];
+			fnt := Font.open(display, fname);
+			if(fnt == nil)
+				return sys->sprint("can't open font %s: %r", fname);
+			tbl_fontrefs[i] = fnt;
+		}
+	}
+	return "";
+}
+
+# Assumes items are set but no geometry.  Computes width / height /
+# ascent for a single-line cell, and positions items within it.
+tbl_cell_geom(c: ref TblCell)
+{
+	h := 0;
+	a := 0;
+	for(it := c.items; it != nil; it = it.next){
+		fnt := tbl_fontrefs[it.fontnum];
+		if(fnt == nil)
+			continue;
+		if(fnt.ascent > a){
+			h += fnt.ascent - a;
+			a = fnt.ascent;
+		}
+		bh := fnt.height - fnt.ascent;
+		if(bh > h - a)
+			h = a + bh;
+	}
+	x := 0;
+	for(it = c.items; it != nil; it = it.next){
+		fnt := tbl_fontrefs[it.fontnum];
+		if(fnt == nil){
+			it.width = 0;
+			it.pos = Point(x, 0);
+			continue;
+		}
+		it.width = fnt.width(it.s);
+		it.pos = Point(x, a - fnt.ascent);
+		x += it.width;
+	}
+	c.width = x;
+	c.height = h;
+	c.ascent = a;
+}
+
+tbl_col_geom(tab: ref Tbl, ci: int)
+{
+	col := tab.cols[ci];
+	col.width = 0;
+	for(ri := 0; ri < tab.nrow; ri++){
+		c := tab.rows[ri].cells[ci];
+		if(c == nil)
+			continue;
+		if(c.width > col.width)
+			col.width = c.width;
+	}
+}
+
+tbl_row_geom(tab: ref Tbl, ri: int)
+{
+	row := tab.rows[ri];
+	h := 0;
+	a := 0;
+	for(ci := 0; ci < tab.ncol; ci++){
+		c := row.cells[ci];
+		if(c == nil)
+			continue;
+		if(c.height > h)
+			h = c.height;
+		if(c.ascent > a)
+			a = c.ascent;
+	}
+	row.height = h;
+	row.ascent = a;
+}
+
+# Assuming row / col geoms are set, position rows, cols, and cells.
+tbl_table_geom(tab: ref Tbl)
+{
+	bd := tab.border;
+	orig := Point(0, 0);
+	if(bd > 0)
+		orig = Point(TABHPAD+bd, TABVPAD+bd);
+
+	o := orig;
+	for(ci := 0; ci < tab.ncol; ci++){
+		col := tab.cols[ci];
+		col.pos = o;
+		o.x += col.width;
+		if(ci < tab.ncol-1)
+			o.x += TABHPAD;
+	}
+	if(bd > 0)
+		o.x += TABHPAD + bd;
+	tab.width = o.x;
+
+	o = orig;
+	for(ri := 0; ri < tab.nrow; ri++){
+		row := tab.rows[ri];
+		row.pos = o;
+		o.y += row.height;
+		if(ri < tab.nrow-1)
+			o.y += TABVPAD;
+	}
+	if(bd > 0)
+		o.y += TABVPAD + bd;
+	tab.height = o.y;
+
+	# position each cell: origin is at the column's top-left, adjusted
+	# for per-cell horizontal alignment.
+	for(ri = 0; ri < tab.nrow; ri++){
+		row := tab.rows[ri];
+		for(ci := 0; ci < tab.ncol; ci++){
+			c := row.cells[ci];
+			if(c == nil)
+				continue;
+			col := tab.cols[ci];
+			x := col.pos.x;
+			y := row.pos.y;
+			al := c.halign;
+			case al {
+			Aright =>
+				x += col.width - c.width;
+			Acenter =>
+				x += (col.width - c.width) / 2;
+			}
+			# vertical center within the row
+			y += (row.height - c.height) / 2;
+			c.pos = Point(x, y);
+		}
+	}
+}
+
+# Draw all cell text items on the named canvas.
+tbl_create_cells(f: ref File, tab: ref Tbl, canv: string): string
+{
+	t := f.tk;
+	for(ri := 0; ri < tab.nrow; ri++){
+		row := tab.rows[ri];
+		for(ci := 0; ci < tab.ncol; ci++){
+			c := row.cells[ci];
+			if(c == nil)
+				continue;
+			for(it := c.items; it != nil; it = it.next){
+				fnt := tbl_fontrefs[it.fontnum];
+				if(fnt == nil || it.s == "")
+					continue;
+				x := c.pos.x + it.pos.x;
+				y := c.pos.y + it.pos.y;
+				v := tkcmd(t, canv + " create text " + string x + " "
+					+ string y + " -anchor nw -font " + fnt.name
+					+ " -text " + tk->quote(it.s));
+				if(len v > 0 && v[0] == '!')
+					return v;
+			}
+		}
+	}
+	return "";
+}
+
+tbl_create_border(f: ref File, tab: ref Tbl, canv: string): string
+{
+	t := f.tk;
+	bd := tab.border;
+	if(bd <= 0)
+		return "";
+	x1 := bd / 2;
+	y1 := bd / 2;
+	x2 := tab.width - bd/2 - 1;
+	y2 := tab.height - bd/2 - 1;
+	v := tkcmd(t, canv + " create rectangle " + string x1 + " " + string y1
+		+ " " + string x2 + " " + string y2 + " -width " + string bd);
+	if(len v > 0 && v[0] == '!')
+		return v;
+	return "";
+}
+
+# Draw a horizontal rule under the header row, and a vertical rule
+# between each pair of columns.
+tbl_create_rules(f: ref File, tab: ref Tbl, canv: string): string
+{
+	t := f.tk;
+	if(tab.nrow >= 2){
+		y := tab.rows[0].pos.y + tab.rows[0].height + TABVPAD/2;
+		v := tkcmd(t, canv + " create line 0 " + string y + " "
+			+ string tab.width + " " + string y + " -width 1");
+		if(len v > 0 && v[0] == '!')
+			return v;
+	}
+	for(ci := 0; ci < tab.ncol-1; ci++){
+		col := tab.cols[ci];
+		x := col.pos.x + col.width + TABHPAD/2;
+		v := tkcmd(t, canv + " create line " + string x + " 0 "
+			+ string x + " " + string tab.height + " -width 1");
+		if(len v > 0 && v[0] == '!')
+			return v;
+	}
+	return "";
+}
+
+# Build the Tbl object from a parsed cell matrix and alignment vector.
+tbl_build(cells: array of array of string, align: array of int): ref Tbl
+{
+	nrow := len cells;
+	if(nrow == 0)
+		return nil;
+	ncol := len align;
+	if(ncol == 0)
+		return nil;
+	tab := ref Tbl(nrow, ncol, 0, 0, 1, array[ncol] of ref TblCol,
+		array[nrow] of ref TblRow);
+	for(ci := 0; ci < ncol; ci++)
+		tab.cols[ci] = ref TblCol(0, align[ci], Point(0,0));
+	for(ri := 0; ri < nrow; ri++){
+		row := ref TblRow(array[ncol] of ref TblCell, 0, 0, Point(0,0));
+		for(ci = 0; ci < ncol; ci++){
+			text := "";
+			if(ri < len cells && ci < len cells[ri])
+				text = cells[ri][ci];
+			items := tbl_cellitems(text);
+			# header row is bold
+			if(ri == 0)
+				items = tbl_promotebold(items);
+			c := ref TblCell(items, align[ci], 0, 0, 0, Point(0,0), ri, ci);
+			tbl_cell_geom(c);
+			row.cells[ci] = c;
+		}
+		tab.rows[ri] = row;
+	}
+	for(ci = 0; ci < ncol; ci++)
+		tbl_col_geom(tab, ci);
+	for(ri = 0; ri < nrow; ri++)
+		tbl_row_geom(tab, ri);
+	tbl_table_geom(tab);
+	return tab;
+}
+
+# Upgrade each Roman item in a run to Bold (used for header cells).
+tbl_promotebold(head: ref TblItem): ref TblItem
+{
+	for(it := head; it != nil; it = it.next){
+		if(it.fontnum == tbl_fnum(TBL_Roman, TBL_Size10))
+			it.fontnum = tbl_fnum(TBL_Bold, TBL_Size10);
+	}
+	return head;
+}
+
+# Render a parsed markdown table at the current insert cursor.  Creates
+# a canvas, lays it out, embeds it via `window create`, and records the
+# (canvas, source) pair so mddump can round-trip it.
+mdrendertable(f: ref File, cells: array of array of string,
+	align: array of int, src: string): string
+{
+	t := f.tk;
+	display: ref Draw->Display;
+	if(t != nil && t.image != nil)
+		display = t.image.display;
+	else if(ctxt != nil)
+		display = ctxt.display;
+	if(display == nil)
+		return "no display";
+	tab := tbl_build(cells, align);
+	if(tab == nil)
+		return "empty table";
+	err := tbl_loadfonts(display);
+	if(err != "")
+		return err;
+	# rebuild geometry now that fonts are loaded (widths may have been 0
+	# during initial cell_geom if fonts weren't yet open)
+	for(ri := 0; ri < tab.nrow; ri++)
+		for(ci := 0; ci < tab.ncol; ci++)
+			tbl_cell_geom(tab.rows[ri].cells[ci]);
+	for(ci = 0; ci < tab.ncol; ci++)
+		tbl_col_geom(tab, ci);
+	for(ri = 0; ri < tab.nrow; ri++)
+		tbl_row_geom(tab, ri);
+	tbl_table_geom(tab);
+
+	id := f.tablectr;
+	f.tablectr = id + 1;
+	canv := ".ft.t.table" + string id;
+	v := tkcmd(t, "canvas " + canv + " -width " + string tab.width
+		+ " -height " + string tab.height);
+	if(len v > 0 && v[0] == '!')
+		return v;
+
+	err = tbl_create_cells(f, tab, canv);
+	if(err != "")
+		return err;
+	err = tbl_create_border(f, tab, canv);
+	if(err != "")
+		return err;
+	err = tbl_create_rules(f, tab, canv);
+	if(err != "")
+		return err;
+
+	tkcmd(t, ".ft.t window create insert -window " + canv);
+	mdput(f, "\n", DEFTAG);
+	f.tables = ref MdTable(canv, src) :: f.tables;
+	return "";
+}
+
+# Destroy any embedded table canvases and forget them.  Safe to call
+# even if f.tables is empty.
+mdcleartables(f: ref File)
+{
+	t := f.tk;
+	for(l := f.tables; l != nil; l = tl l){
+		m := hd l;
+		tkcmd(t, "destroy " + m.canv);
+	}
+	f.tables = nil;
+	f.tablectr = 0;
+}
+
+# Look up a canvas path in f.tables by short or long name.  The dump
+# stream reports widget paths like ".ft.t.table0"; we compare against
+# both the stored path and its trailing component.
+mdfindtable(f: ref File, name: string): string
+{
+	for(l := f.tables; l != nil; l = tl l){
+		m := hd l;
+		if(m.canv == name)
+			return m.src;
+		# strip any leading path components: match on last segment
+		c := m.canv;
+		i := len c;
+		while(i > 0 && c[i-1] != '.')
+			i--;
+		if(c[i:] == name)
+			return m.src;
+		i = len name;
+		while(i > 0 && name[i-1] != '.')
+			i--;
+		if(name[i:] == c[i:] && c != "" && name != "")
+			return m.src;
+	}
+	return "";
+}
+
 loadfile(f: ref File, file: string): int
 {
 	f.size = DEFSIZE;
@@ -1513,6 +2297,7 @@ loadfile1(f: ref File, file: string): int
 		return -1;
 	t := f.tk;
 	tkcmd(t, ".ft.t delete 1.0 end");
+	mdcleartables(f);
 	f.rawview = 0;
 	mdinsert(f, string a[0:n]);
 	tkcmd(t, ".b.View configure -text Raw");
